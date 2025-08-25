@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+
+import sys
+import numpy as np
+from math import ceil
+from dataclasses import dataclass
+import rospy
+import actionlib
+from actionlib_msgs.msg import GoalStatus
+from spar_msgs.msg import FlightMotionAction, FlightMotionGoal
+
+
+@dataclass
+class Waypoint:
+   x: float
+   y: float
+   z: float
+   yaw: float
+
+
+def send_wp(spar_client, x, y, z, yaw):
+   speed = rospy.get_param("~speed", 1.0)
+   accuracy = rospy.get_param("~accuracy", 0.1)
+
+   goal = FlightMotionGoal()
+   goal.motion = FlightMotionGoal.MOTION_GOTO
+   goal.position.x = x
+   goal.position.y = y
+   goal.position.z = z
+   goal.yaw = yaw
+   goal.velocity_vertical = speed
+   goal.velocity_horizontal = speed
+   goal.yawrate = speed
+   goal.wait_for_convergence = True
+   goal.position_radius = accuracy
+   goal.yaw_range = accuracy
+
+   spar_client.send_goal(goal)
+   rospy.on_shutdown(lambda: spar_client.cancel_goal())
+   spar_client.wait_for_result()
+   rospy.sleep(2)
+
+   return spar_client.get_state() == GoalStatus.SUCCEEDED
+
+
+def send_wps(spar_client):
+   success = True
+   alt = 1.5
+   yaw = 0.0
+   start_x, start_y = -1.0, -1.0  # Physical starting position
+
+   # Grid parameters - 8m x 5m inner flight area
+   x_min, x_max = -4.0, 4.0
+   y_min, y_max = -2.5, 2.5
+   x_step = 1.0
+   y_step = 0.5
+
+   wps = []
+
+   # Generate grid coordinates using numpy linspace with ceil for better coverage
+   num_x_points = ceil((x_max - x_min) / x_step) + 1
+   
+   x_coords = np.linspace(x_min, x_max, num_x_points)
+   y_coords = [y_min,y_max]
+
+#    ## Between this and the next double # could be replaced with a simple starting waypoint is (-1,-1,0) -> (-1,-1,alt) -> (-4,-2.5,alt). 
+#    # The reason it is the way it currently is, is to allow for the addition of a potential "Better" scanning method that takes into account the movement from the origin in its scan
+#    # This would technically be more efficient (Although I dont think by much) and requires alot more code initialisation as can be seen below
+
+#    # Find closest grid point that's <= starting position
+#    closest_x_idx = np.searchsorted(x_coords, start_x, side='right') - 1
+#    closest_y_idx = np.searchsorted(y_coords, start_y, side='right') - 1
+
+#    closest_x = x_coords[closest_x_idx]
+#    closest_y = y_coords[closest_y_idx]
+
+#    # First waypoint: fly from physical start to closest grid point at altitude
+#    wps.append(Waypoint(float(closest_x), float(closest_y), alt, yaw))
+
+#    # Navigate to corner for systematic scan
+#    current_x_idx = closest_x_idx
+#    current_y_idx = closest_y_idx
+
+#    # Move left to leftmost column
+#    while current_x_idx > 0:
+#        current_x_idx -= 1
+#        wps.append(Waypoint(float(x_coords[current_x_idx]), float(y_coords[current_y_idx]), alt, yaw))
+
+#    # Move to bottom of current column
+#    while current_y_idx > 0:
+#        current_y_idx -= 1
+#        wps.append(Waypoint(float(x_coords[current_x_idx]), float(y_coords[current_y_idx]), alt, yaw))
+
+   ##
+
+   # # Simple alternative - comment out the above section and uncomment below for basic approach:
+   # # Go directly to start position at altitude, then to corner
+   wps.append(Waypoint(start_x, start_y, alt, yaw))  # (-1, -1, alt)
+   wps.append(Waypoint(x_min, y_min, alt, yaw))      # (-4, -2.5, alt)
+
+   # Systematic scan pattern
+   going_up = True
+
+   for col_idx in range(len(x_coords)):
+       x = x_coords[col_idx]
+       
+       if going_up:
+           for y_idx in range(len(y_coords)):
+               y = y_coords[y_idx]
+               wps.append(Waypoint(float(x), float(y), alt, yaw))
+       else:
+           for y_idx in range(len(y_coords)-1, -1, -1):
+               y = y_coords[y_idx]
+               wps.append(Waypoint(float(x), float(y), alt, yaw))
+       
+       going_up = not going_up
+
+   for i, wp in enumerate(wps, 1):
+       rospy.loginfo(f"Sending waypoint {i}/{len(wps)} at ({wp.x}, {wp.y}, {wp.z})...")
+       if not send_wp(spar_client, wp.x, wp.y, wp.z, wp.yaw):
+           rospy.logerr("Waypoints failed!")
+           success = False
+           break
+
+   if success:
+       rospy.loginfo("Waypoints complete!")
+
+
+def main(args):
+   rospy.init_node('takeoff', anonymous=True)
+   action_ns = rospy.get_param("~action_topic", 'spar/flight')
+
+   spar_client = actionlib.SimpleActionClient(action_ns, FlightMotionAction)
+   rospy.loginfo("Waiting for spar...")
+   spar_client.wait_for_server()
+
+   if not rospy.is_shutdown():
+       send_wps(spar_client)
+
+
+if __name__ == '__main__':
+   try:
+       main(sys.argv)
+   except rospy.ROSInterruptException:
+       pass
